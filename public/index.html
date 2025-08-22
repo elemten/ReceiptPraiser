@@ -1,0 +1,206 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Upload and analyze</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px; background: #0b1020; color: #e7eaf3; }
+      .wrap { max-width: 760px; margin: 0 auto; }
+      .card { background: #121936; border: 1px solid #1e2a5a; border-radius: 14px; padding: 20px; }
+      h1 { margin: 0 0 12px; font-size: 22px; }
+      .mt { margin-top: 12px; }
+      button { padding: 10px 16px; border: 0; border-radius: 10px; background: #5b7cfa; color: white; font-weight: 600; cursor: pointer; }
+      button:disabled { opacity: 0.6; cursor: default; }
+      pre { background: #0e152e; color: #e7eaf3; padding: 12px; border-radius: 8px; overflow: auto; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 6px 8px; border-bottom: 1px solid #1e2a5a; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.3/dist/jspdf.plugin.autotable.min.js"></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Upload and analyze</h1>
+        <p>Accepts images and pdf. The server returns structured data. The download renders receipt or invoice layout when possible.</p>
+
+        <input id="file" type="file" accept="image/*,application/pdf" />
+
+        <div class="mt">
+          <button id="analyzeBtn">Analyze</button>
+          <button id="downloadBtn" disabled>Download pdf</button>
+        </div>
+
+        <div class="mt">
+          <strong>Result preview</strong>
+          <pre id="out">Waiting for result...</pre>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const analyzeBtn = document.getElementById("analyzeBtn");
+      const downloadBtn = document.getElementById("downloadBtn");
+      const out = document.getElementById("out");
+      const fileInput = document.getElementById("file");
+
+      let lastResult = null;
+
+      analyzeBtn.addEventListener("click", async () => {
+        const f = fileInput.files && fileInput.files[0];
+        if (!f) { alert("Pick a file first"); return; }
+
+        analyzeBtn.disabled = true;
+        out.textContent = "Uploading and analyzing...";
+
+        const ac = new AbortController();
+        const t = setTimeout(() => ac.abort(), 35000);
+
+        try {
+          const form = new FormData();
+          form.append("file", f);
+          const res = await fetch("/analyze", { method: "POST", body: form, signal: ac.signal });
+          if (!res.ok) throw new Error(await res.text());
+          const json = await res.json();
+          lastResult = json.data;
+          out.textContent = JSON.stringify(json.data, null, 2);
+          downloadBtn.disabled = false;
+        } catch (e) {
+          out.textContent = "Network or provider error: " + (e.message || e);
+        } finally {
+          clearTimeout(t);
+          analyzeBtn.disabled = false;
+        }
+      });
+
+      function money(x) {
+        if (x == null || x === "") return "";
+        return String(x);
+      }
+
+      function renderReceiptPDF(r) {
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ unit: "pt", format: "letter" });
+        let y = 60;
+
+        doc.setFontSize(18);
+        doc.text(r.vendor_name || "Receipt", 40, y);
+        y += 8;
+
+        doc.setFontSize(10);
+        const meta = [r.vendor_address, r.vendor_phone].filter(Boolean).join("  ");
+        if (meta) { y += 14; doc.text(meta, 40, y); }
+
+        y += 18;
+        const line1 = [
+          r.date ? `Date: ${r.date}` : "",
+          r.time ? `Time: ${r.time}` : "",
+          r.invoice_number ? `Invoice: ${r.invoice_number}` : "",
+          r.order_number ? `Order: ${r.order_number}` : ""
+        ].filter(Boolean).join("   ");
+        if (line1) { doc.text(line1, 40, y); y += 16; }
+
+        const body = Array.isArray(r.items) ? r.items.map(it => ([
+          it.name || "",
+          it.qty || "",
+          money(it.unit_price || ""),
+          money(it.line_total || it.price || "")
+        ])) : [];
+
+        doc.autoTable({
+          startY: y,
+          head: [["Item", "Qty", "Unit", "Line"]],
+          body,
+          styles: { fontSize: 10, cellPadding: 6 },
+          headStyles: { fillColor: [30, 42, 90] },
+          columnStyles: {
+            0: { cellWidth: 260 },
+            1: { halign: "right", cellWidth: 60 },
+            2: { halign: "right", cellWidth: 90 },
+            3: { halign: "right", cellWidth: 90 }
+          }
+        });
+
+        y = doc.lastAutoTable.finalY + 10;
+
+        function right(label, value) {
+          if (!value && value !== 0) return;
+          const xLabel = 360;
+          const xValue = 500;
+          doc.text(label, xLabel, y);
+          doc.text(String(value), xValue, y, { align: "right" });
+          y += 16;
+        }
+
+        if (r.subtotal) right("Subtotal", money(r.subtotal));
+
+        if (Array.isArray(r.discounts)) {
+          r.discounts.forEach(d => right(d.name || "Discount", money(d.amount)));
+        }
+
+        if (Array.isArray(r.taxes)) {
+          r.taxes.forEach(t => {
+            const label = t.rate ? `Tax ${t.name || ""} ${t.rate}%`.trim() : `Tax ${t.name || ""}`.trim();
+            right(label, money(t.amount));
+          });
+        }
+
+        if (Array.isArray(r.fees)) {
+          r.fees.forEach(f => right(f.name || "Fee", money(f.amount)));
+        }
+
+        if (r.tips) right("Tip", money(r.tips));
+
+        if (r.total) {
+          doc.setFont(undefined, "bold");
+          right("Total", money(r.total));
+          doc.setFont(undefined, "normal");
+        }
+
+        y += 6;
+        const pay = [r.payment_method, r.last4 ? `•••• ${r.last4}` : ""].filter(Boolean).join("  ");
+        if (pay) { doc.text(`Paid with ${pay}`, 360, y); y += 16; }
+        if (r.currency) { doc.text(`Currency: ${r.currency}`, 360, y); y += 16; }
+        if (r.notes) {
+          y += 10;
+          doc.setFontSize(10);
+          doc.text("Notes", 40, y);
+          y += 14;
+          const lines = doc.splitTextToSize(String(r.notes), 520);
+          doc.text(lines, 40, y);
+        }
+
+        doc.save("analysis.pdf");
+      }
+
+      function renderOtherPDF(r) {
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF();
+        let y = 16;
+
+        function line(txt) {
+          const lines = doc.splitTextToSize(txt, 180);
+          doc.text(lines, 14, y);
+          y += 6 * lines.length;
+        }
+
+        doc.setFontSize(16);
+        line(r.title || "Analysis");
+
+        doc.setFontSize(11);
+        if (r.summary) { line("Summary:"); line(String(r.summary)); }
+        if (r.notes) { line("Notes:"); line(String(r.notes)); }
+
+        doc.save("analysis.pdf");
+      }
+
+      downloadBtn.addEventListener("click", () => {
+        if (!lastResult) return;
+        const t = (lastResult.document_type || "").toLowerCase();
+        if (t === "receipt" || t === "invoice") renderReceiptPDF(lastResult);
+        else renderOtherPDF(lastResult);
+      });
+    </script>
+  </body>
+</html>
